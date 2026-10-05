@@ -704,6 +704,8 @@ esp_err_t web_player_start(const char *ip)
         { .uri = "/api/ext/offset",   .method = HTTP_POST, .handler = ext_link_h_offset, .user_ctx = NULL },
         { .uri = "/api/ext/clear",    .method = HTTP_POST, .handler = ext_link_h_clear,  .user_ctx = NULL },
         { .uri = "/api/ext/cover",    .method = HTTP_POST, .handler = ext_link_h_cover,  .user_ctx = NULL },
+        { .uri = "/api/ext/cmd",      .method = HTTP_GET,  .handler = ext_link_h_cmd,    .user_ctx = NULL },
+        { .uri = "/api/ext/cmd",      .method = HTTP_POST, .handler = ext_link_h_cmd,    .user_ctx = NULL },
 
         /* 屏幕朝向（横屏两个方向之间切换，免烧录）----------------------- */
         { .uri = "/api/rot",          .method = HTTP_POST, .handler = lvgl_port_h_rot,   .user_ctx = NULL },

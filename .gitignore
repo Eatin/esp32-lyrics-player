@@ -31,6 +31,8 @@
 /tools/lyrics_cache/
 /tools/fonttest/
 /tools/preview/
+__pycache__/
+*.pyc
 
 # ---------- 4. 日志与临时文件 ----------
 *.log

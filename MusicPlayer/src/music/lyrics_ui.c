@@ -25,6 +25,13 @@
  *   2) 右下角的「来源 / IP」行只在**不正常**时才出现 ——
  *      歌在放且有歌词 = 电脑推送一切正常，一个字都不显示；
  *      只有没推送 / 没歌词时才亮出来（那时它才有用：告诉你去哪个 IP 看控制台）。
+ *
+ * 手势一览（都没有实体按钮，靠触摸）：
+ *   长按 0.8s      -> 回播放器页
+ *   左滑           -> 下一曲（投递 XL_CMD_NEXT，由电脑上的播放器执行）
+ *   右滑           -> 上一曲（投递 XL_CMD_PREV）
+ *   切歌后屏中央弹 1.2 秒提示，见 toast_show()。
+ *   滑动判定是自己实现的（不用 LVGL 的 GESTURE，原因见 scr_pressing_cb 上方的注释）。
  */
 #include "lyrics_ui.h"
 #include "music_ui.h"
@@ -76,6 +83,7 @@ static lv_obj_t *s_lbl_hint   = NULL;
 static lv_obj_t *s_bar        = NULL;
 static lv_obj_t *s_lbl_time   = NULL;
 static lv_obj_t *s_lbl_src    = NULL;
+static lv_obj_t *s_lbl_toast  = NULL;   /* 滑动切歌时的临时提示 */
 
 static uint8_t *s_cv_buf      = NULL;   /* 封面像素（自己一份，和 ext_link 解耦） */
 static char     s_tmp[256];
@@ -84,6 +92,19 @@ static bool s_visible       = false;
 static int  s_last_idx      = -2;
 static int  s_last_track    = -2;
 static int  s_last_cover    = -1;
+static uint32_t s_toast_at   = 0;       /* 提示弹出时刻(lv_tick)，0=没在显示 */
+
+/* ---- 滑动切歌的状态（判定逻辑见 scr_pressing_cb 上方的注释）---- */
+#define SWIPE_MIN_DX  60   /* 水平净位移超过这么多才算一次滑动 */
+#define SWIPE_SLANT   2    /* |dx| 必须大于 |dy|*2 才算横向滑动 */
+#define SWIPE_JITTER  45   /* 单帧跳这么多像素：先怀疑是毛刺   */
+#define SWIPE_HOLD_GUARD 30  /* 已经横移这么多就不算「长按」 */
+
+static lv_point_t s_sw_last;            /* 上一个可信位置     */
+static int32_t    s_sw_dx      = 0;     /* 累计水平位移       */
+static int32_t    s_sw_dy      = 0;     /* 累计竖直位移       */
+static bool       s_sw_active  = false;
+static int        s_sw_jump    = 0;     /* 连续「可疑跳变」计数 */
 
 static void lyrics_timer_cb(lv_timer_t *t);
 
@@ -96,11 +117,99 @@ static void fmt_ms(uint32_t ms, char *out, size_t n)
 }
 
 /** 歌词页不放返回按钮，改用隐藏手势：长按任意位置 -> 回播放器页。
- *  长按时间由 lvgl_port.c 里的 indev long_press_time 决定（已设 800ms）。 */
+ *  长按时间由 lvgl_port.c 里的 indev long_press_time 决定（已设 800ms）。
+ *
+ *  注意：LVGL 的长按是**纯计时**的，手指慢慢划也会在 800ms 时触发。
+ *  所以这里先看一眼横向位移 —— 已经在划了就当它是滑动，不当作长按。 */
 static void scr_long_press_cb(lv_event_t *e)
 {
     (void)e;
+    if (s_sw_active && LV_ABS(s_sw_dx) > SWIPE_HOLD_GUARD) return;
     lyrics_ui_back();
+}
+
+/** 屏中央弹一条 1.2 秒后自动消失的提示（滑动切歌的即时反馈）。 */
+static void toast_show(const char *txt)
+{
+    if (!s_lbl_toast) return;
+    lv_label_set_text(s_lbl_toast, txt);
+    lv_obj_clear_flag(s_lbl_toast, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_lbl_toast);
+    s_toast_at = lv_tick_get();
+    if (!s_toast_at) s_toast_at = 1;   /* 0 是「没在显示」的哨兵值，避开 */
+}
+
+/* ---------------- 滑动切歌：自己做判定，不用 LVGL 的 GESTURE ----------------
+ *
+ * 为什么不用 LV_EVENT_GESTURE？
+ *   它把每次采样的位移**无条件累加**（lv_indev.c 的 indev_gesture），
+ *   所以**一个坏采样就能把方向带偏** —— 实测抓到过：
+ *   手指明明在左滑（面板 pointX 95→129→167…→317 稳定递增），
+ *   中间有一帧 AXS15231B 返回了 raw=(0,384) 的野值，
+ *   累加后变成「右滑」，于是该发「下一曲」却发了「上一曲」。
+ *
+ * 这里改成自己算：按下记起点，按压过程中累计位移，但**单帧跳变超过
+ *   SWIPE_JITTER 就先当毛刺丢掉**（连续两帧都跳且方向一致才采信，
+ *   这样真·快速滑动不会丢帧）。松手时看总位移够不够、够不够「横」，
+ *   再用净位移判方向 —— 野值再也影响不了结论。
+ */
+
+static void scr_pressed_cb(lv_event_t *e)
+{
+    (void)e;
+    lv_indev_t *indev = lv_indev_get_act();
+    if (!indev) return;
+    lv_indev_get_point(indev, &s_sw_last);
+    s_sw_dx = s_sw_dy = 0;
+    s_sw_jump   = 0;
+    s_sw_active = true;
+}
+
+static void scr_pressing_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!s_sw_active) return;
+    lv_indev_t *indev = lv_indev_get_act();
+    if (!indev) return;
+
+    lv_point_t p;
+    lv_indev_get_point(indev, &p);
+
+    const int32_t dx = (int32_t)p.x - s_sw_last.x;
+    const int32_t dy = (int32_t)p.y - s_sw_last.y;
+
+    if (LV_ABS(dx) > SWIPE_JITTER || LV_ABS(dy) > SWIPE_JITTER) {
+        /* 一步跳这么远，先当毛刺扔掉；连续两次都跳才认作真·快速滑动 */
+        if (++s_sw_jump < 2) return;
+    } else {
+        s_sw_jump = 0;
+    }
+
+    s_sw_dx += dx;
+    s_sw_dy += dy;
+    s_sw_last = p;
+}
+
+/** 松手时判定：左滑 = 下一曲，右滑 = 上一曲。
+ *  板子**不播音频**，所以只是把命令投递给 ext_link；真正切歌的是电脑上的
+ *  播放器 —— PC 下次 POST /api/ext/pos 时取走并按下系统媒体键
+ *  （见 ext_link.h 的「反向通道」）。切完 PC 推来新曲目，屏上两行自动更新。 */
+static void scr_released_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!s_sw_active) return;
+    s_sw_active = false;
+
+    if (LV_ABS(s_sw_dx) < SWIPE_MIN_DX) return;                    /* 位移不够 */
+    if (LV_ABS(s_sw_dx) < LV_ABS(s_sw_dy) * SWIPE_SLANT) return;   /* 太斜了   */
+
+    if (s_sw_dx < 0) {                     /* lv x 变小 = 手指往左划 */
+        ext_link_post_cmd(XL_CMD_NEXT);
+        toast_show("下一曲 \u2192");
+    } else {
+        ext_link_post_cmd(XL_CMD_PREV);
+        toast_show("\u2190 上一曲");
+    }
 }
 
 /** 把子树里所有对象的「可点击」标志清掉。
@@ -179,8 +288,15 @@ void lyrics_ui_init(void)
 
     /* ---------------- 右：歌名 ---------------- */
     /* 这里以前有个「返回」按钮，现在去掉了（歌词页是常驻主界面）。
-     * 回播放器页的办法：长按屏幕约 0.8 秒，或等停播 60 秒自动返回。 */
+     * 回播放器页的办法：长按屏幕约 0.8 秒，或等停播 60 秒自动返回。
+     * 另加一个手势：左右滑动切歌（见 scr_released_cb）。 */
     lv_obj_add_event_cb(s_scr, scr_long_press_cb, LV_EVENT_LONG_PRESSED, NULL);
+    /* 滑动切歌不用 LVGL 的 LV_EVENT_GESTURE —— 它无条件累加每帧位移，
+     * 一个坏采样就会把方向带偏（原因见 scr_pressing_cb 上方注释），
+     * 所以自己用 PRESSED / PRESSING / RELEASED 三件套算。 */
+    lv_obj_add_event_cb(s_scr, scr_pressed_cb,    LV_EVENT_PRESSED,      NULL);
+    lv_obj_add_event_cb(s_scr, scr_pressing_cb,   LV_EVENT_PRESSING,     NULL);
+    lv_obj_add_event_cb(s_scr, scr_released_cb,   LV_EVENT_RELEASED,     NULL);
 
     s_lbl_song = lv_label_create(s_scr);
     lv_label_set_text(s_lbl_song, "歌词");
@@ -257,6 +373,21 @@ void lyrics_ui_init(void)
     /* 开局先藏起来，等定时器判断「是不是正常播放」再决定要不要露出来 */
     lv_obj_add_flag(s_lbl_src, LV_OBJ_FLAG_HIDDEN);
 
+    /* ---------------- 滑动切歌的临时提示（默认隐藏） ---------------- */
+    /* 放在 make_children_click_transparent() 之前，这样它的 CLICKABLE 也会被收掉，
+     * 提示出现的那 1.2 秒里不会把滑动手势吃掉。 */
+    s_lbl_toast = lv_label_create(s_scr);
+    lv_label_set_text(s_lbl_toast, "");
+    lv_obj_set_style_text_font(s_lbl_toast, F_CUR, 0);
+    lv_obj_set_style_text_color(s_lbl_toast, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_bg_color(s_lbl_toast, lv_color_hex(0x1B2436), 0);
+    lv_obj_set_style_bg_opa(s_lbl_toast, LV_OPA_80, 0);
+    lv_obj_set_style_radius(s_lbl_toast, 8, 0);
+    lv_obj_set_style_pad_hor(s_lbl_toast, 14, 0);
+    lv_obj_set_style_pad_ver(s_lbl_toast, 6, 0);
+    lv_obj_align(s_lbl_toast, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_add_flag(s_lbl_toast, LV_OBJ_FLAG_HIDDEN);
+
     /* 这一页没有任何按钮了：把所有子对象的点击权收掉，
      * 让「长按任意位置」这种隐藏手势能真正落到整块屏上。 */
     make_children_click_transparent(s_scr);
@@ -326,6 +457,12 @@ static void lyrics_timer_cb(lv_timer_t *t)
     }
 
     if (!s_visible) return;
+
+    /* ---- 滑动切歌的提示：1.2 秒后自动收掉 ---- */
+    if (s_toast_at && lv_tick_elaps(s_toast_at) >= 1200) {
+        s_toast_at = 0;
+        if (s_lbl_toast) lv_obj_add_flag(s_lbl_toast, LV_OBJ_FLAG_HIDDEN);
+    }
 
     /* ---- 左侧封面 ---- */
     refresh_cover();

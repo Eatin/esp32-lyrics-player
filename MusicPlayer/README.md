@@ -196,6 +196,9 @@ for f in *.mp3; do ffmpeg -i "$f" -acodec pcm_s16le -ar 44100 -ac 2 "${f%.mp3}.w
 - **没有「返回」按钮**。想回播放器页：**在屏上长按约 0.8 秒**（隐藏手势，整块屏都有效；
   响应时间由 `lvgl_port.c` 的 `indev_drv.long_press_time = 800` 控制），
   或者等停播超过 1 分钟自动回去。
+- **左右滑动切歌**：**左滑 = 下一曲，右滑 = 上一曲**，屏中央弹 1.2 秒提示。
+  注意板子**自己不播音频**，所以这只是「请电脑上的播放器切歌」——
+  命令会捎给 PC 端脚本，由它按一下系统媒体键（详见 6.5 的「反向命令通道」）。
 - **右下角「来源 / 地址」那一行只在出问题时才出现**：
   歌在放 + 有歌词 = 电脑推送一切正常，整行隐藏（不显示 IP，也不显示「有歌词」这种废话）；
   只有**没推送 / 没歌词**时才亮出来 —— 那时它才有用（告诉你去哪个 IP 开控制台）。
@@ -303,6 +306,26 @@ espvenv\Scripts\python.exe kugou_bridge.py          # 自动发现板子并开�
 4. 之后持续 `POST /api/ext/pos` 推送位置
 5. 退出（Ctrl+C）时通知板子清空
 
+**反向**（板子 → 电脑）：在板子上左滑/右滑要切歌，命令怎么回到电脑？
+
+板子**不播音频**，切歌必须由电脑上的播放器执行。做法是让命令**搭位置推送的顺风车**：
+
+```
+板子：左滑 -> ext_link_post_cmd(XL_CMD_NEXT) 存进命令槽
+                              │
+PC：POST /api/ext/pos ────────►│  板子返回 {"ok":1,"cmd":"next"} 并清空槽位
+                              │
+PC：收到 "next" -> SendInput 按一下 VK_MEDIA_NEXT_TRACK(0xB0) -> 酷狗切歌
+                              │
+酷狗换歌 -> 桥接脚本发现新曲目 -> 推送新歌词 -> 屏上两行自动更新
+```
+
+- 挂在 `/api/ext/pos` 而不是 `/api/ext/state`：**pos 只有桥接脚本调用**，
+  而 state 会被板子自己的网页控制台轮询，挂 state 上会被网页把命令偷走。
+- 暂停时桥接脚本不再频繁推 pos，所以会改为轮询 `GET /api/ext/cmd` 补位。
+- 媒体键是**全局**的，不要求酷狗在前台；它也正好走酷狗已注册的 SMTC 媒体会话。
+- `--no-remote-key` 可关掉真按键（只打印日志），排查用。
+
 ### 6.3 歌词从哪来
 
 抓歌词的顺序（结果缓存在 `tools/lyrics_cache/`，同一首歌第二次是秒开）：
@@ -352,7 +375,9 @@ espvenv\Scripts\python.exe kugou_bridge.py          # 自动发现板子并开�
 |---|---|---|
 | GET | `/` | 接收控制台页面 |
 | POST | `/api/ext/track?dur=&title=&artist=&album=` | **body 即 LRC 原文**（UTF-8）。新曲目：重置位置、置为播放、解析歌词 |
-| POST | `/api/ext/pos?p=<ms>&s=<0\|1\|2>[&d=<总时长ms>]` | 上报播放位置与状态（0=停 1=播 2=暂停）。`d` 用来在换歌瞬间自愈时长 |
+| POST | `/api/ext/pos?p=<ms>&s=<0\|1\|2>[&d=<总时长ms>]` | 上报播放位置与状态（0=停 1=播 2=暂停）。`d` 用来在换歌瞬间自愈时长。**响应里可能捎带板子投递的命令**：`{"ok":1,"cmd":"next"}`（取走即清空） |
+| GET | `/api/ext/cmd` | 单独取一条板子投递的命令：`{"ok":1,"cmd":"next"\|"prev"\|""}`。暂停时（不推 pos）由 PC 轮询 |
+| POST | `/api/ext/cmd?c=next\|prev\|toggle` | **手动投递**一条切歌命令，走的是和屏上滑动完全相同的通道。可以**不碰屏幕就切歌**（例如在手机上点），也方便自动化测试 |
 | POST | `/api/ext/cover` | **body 即 156×156 RGB565 大端原始像素**（48672 字节）；`?clear=1` 清掉封面 |
 | GET | `/api/ext/state` | 状态 JSON：`{ever,on,live,s,p,lp,d,off,ago,rx,jump,title,ar,al,lrc,lines,cover,cseq}` |
 | POST | `/api/ext/offset?d=<毫秒>` 或 `?v=<毫秒>` | 歌词整体偏移（`d` 为增量，`v` 为绝对值） |

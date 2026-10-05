@@ -66,6 +66,13 @@ static volatile int      s_cover_idx  = 0;
 static volatile bool     s_cover_ready = false;
 static volatile uint32_t s_cover_seq  = 0;
 
+/* 板子 -> PC 的待发命令（取走即清空）。
+ * UI 线程写、httpd 线程读，一个字长，volatile 足够；
+ * 用 take 读-改-写不是原子操作，但两端都是「后到覆盖 / 取走即空」的语义，
+ * 最坏情况只是丢一条连按的命令，不会卡死。 */
+static volatile int      s_cmd         = XL_CMD_NONE;
+static volatile uint32_t s_cmd_count   = 0;   /* 累计投递条数（诊断用） */
+
 /* ------------------------------------------------------------------ */
 /* 小工具                                                              */
 /* ------------------------------------------------------------------ */
@@ -314,6 +321,16 @@ esp_err_t ext_link_h_pos(httpd_req_t *req)
     }
 
     xl_note_pos(p, st);
+
+    /* 顺风车：把 UI 投递的切歌命令捎回给 PC（取走即清空，不会重复触发）。
+     * 无命令时保持原来的最小响应 {"ok":1}，这个接口是高频的，别乱加字节。 */
+    int c = ext_link_take_cmd();
+    if (c != XL_CMD_NONE) {
+        char body[64];
+        snprintf(body, sizeof(body), "{\"ok\":1,\"cmd\":\"%s\"}", ext_link_cmd_name(c));
+        printf("[EXT] PC 取走命令: %s\n", ext_link_cmd_name(c));
+        return reply_json(req, body);
+    }
     return reply_ok(req);
 }
 
@@ -461,6 +478,70 @@ esp_err_t ext_link_h_clear(httpd_req_t *req)
     if (s_cover_ready) { s_cover_ready = false; s_cover_seq++; }
     printf("[EXT] cleared\n");
     return reply_ok(req);
+}
+
+/* ------------------------------------------------------------------ */
+/* 板子 -> PC 命令                                                     */
+/* ------------------------------------------------------------------ */
+
+void ext_link_post_cmd(int cmd)
+{
+    if (cmd == XL_CMD_NONE) return;
+    s_cmd = cmd;
+    s_cmd_count++;
+    printf("[EXT] 投递命令 -> %s（等 PC 下次推位置时取走）\n", ext_link_cmd_name(cmd));
+}
+
+int ext_link_take_cmd(void)
+{
+    int c = s_cmd;
+    if (c != XL_CMD_NONE) s_cmd = XL_CMD_NONE;
+    return c;
+}
+
+const char *ext_link_cmd_name(int cmd)
+{
+    switch (cmd) {
+        case XL_CMD_NEXT:   return "next";
+        case XL_CMD_PREV:   return "prev";
+        case XL_CMD_TOGGLE: return "toggle";
+        default:            return "";
+    }
+}
+
+bool ext_link_cmd_pending(void) { return s_cmd != XL_CMD_NONE; }
+
+/** GET  /api/ext/cmd          —— 取走一条命令（PC 暂停时轮询用）
+ *  POST /api/ext/cmd?c=next   —— 手动投递一条命令
+ *
+ *  后者是给「不想碰屏幕也能切歌」和自动化测试用的（仅局域网可达）。
+ *  语义和 UI 手势投递完全一样：进命令槽，等 PC 来取。 */
+esp_err_t ext_link_h_cmd(httpd_req_t *req)
+{
+    if (req->method == HTTP_POST) {
+        char q[64], v[16];
+        get_qs(req, q, sizeof(q));
+        if (qs_get(q, "c", v, sizeof(v))) {
+            int c = XL_CMD_NONE;
+            if      (!strcmp(v, "next"))   c = XL_CMD_NEXT;
+            else if (!strcmp(v, "prev"))   c = XL_CMD_PREV;
+            else if (!strcmp(v, "toggle")) c = XL_CMD_TOGGLE;
+            if (c != XL_CMD_NONE) {
+                ext_link_post_cmd(c);
+                char body[72];
+                snprintf(body, sizeof(body), "{\"ok\":1,\"queued\":\"%s\"}",
+                         ext_link_cmd_name(c));
+                return reply_json(req, body);
+            }
+        }
+        return reply_json(req, "{\"ok\":0,\"err\":\"need c=next|prev|toggle\"}");
+    }
+
+    int c = ext_link_take_cmd();
+    char body[96];
+    snprintf(body, sizeof(body), "{\"ok\":1,\"cmd\":\"%s\",\"n\":%u}",
+             ext_link_cmd_name(c), (unsigned)s_cmd_count);
+    return reply_json(req, body);
 }
 
 /* ------------------------------------------------------------------ */

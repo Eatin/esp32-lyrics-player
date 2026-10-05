@@ -857,6 +857,117 @@ class Board:
     def clear(self):
         return self._req("/api/ext/clear", data=b"", method="POST")
 
+    def poll_cmd(self):
+        """单独取一条板子投递的命令（暂停时用；正常走 push_pos 的响应捎带）"""
+        return self._req("/api/ext/cmd", method="GET", timeout=2.0).get("cmd", "")
+
+
+# ==========================================================================
+# 三·五、把板子的命令翻成系统媒体键
+# ==========================================================================
+# 板子不播音频（音频一直在电脑的酷狗里），所以在板子上左滑切歌，本质是
+# 「请电脑上的播放器切歌」。板子把命令捎在 /api/ext/pos 的响应里送回来，
+# 这里收到后按一个 Windows 媒体键 —— 媒体键是全局的，不需要酷狗在前后台，
+# 也正好走酷狗已经注册好的那个 SMTC 媒体会话。
+
+VK_MEDIA_NEXT_TRACK = 0xB0
+VK_MEDIA_PREV_TRACK = 0xB1
+VK_MEDIA_PLAY_PAUSE = 0xB3
+
+_CMD_TO_VK = {
+    "next":   VK_MEDIA_NEXT_TRACK,
+    "prev":   VK_MEDIA_PREV_TRACK,
+    "toggle": VK_MEDIA_PLAY_PAUSE,
+}
+_CMD_CN = {"next": "下一曲", "prev": "上一曲", "toggle": "播放/暂停"}
+
+
+def _build_sendinput():
+    """用 ctypes 包一个 SendInput（比已废弃的 keybd_event 可靠）。"""
+    import ctypes
+    from ctypes import wintypes
+
+    # 指针宽度的无符号整数；三处结构体都要用它，写错会导致 SendInput 失败
+    ULONG_PTR = (ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8
+                 else ctypes.c_ulong)
+
+    class KEYBDINPUT(ctypes.Structure):
+        _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
+                    ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
+                    ("dwExtraInfo", ULONG_PTR)]
+
+    class MOUSEINPUT(ctypes.Structure):
+        _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG),
+                    ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                    ("time", wintypes.DWORD), ("dwExtraInfo", ULONG_PTR)]
+
+    class HARDWAREINPUT(ctypes.Structure):
+        _fields_ = [("uMsg", wintypes.DWORD), ("wParamL", wintypes.WORD),
+                    ("wParamH", wintypes.WORD)]
+
+    class _UNION(ctypes.Union):
+        # 必须是完整 union：INPUT 的大小由最大的成员（MOUSEINPUT）决定，
+        # 少写一个成员会让 sizeof(INPUT) 偏小，SendInput 直接返回 0。
+        _fields_ = [("ki", KEYBDINPUT), ("mi", MOUSEINPUT), ("hi", HARDWAREINPUT)]
+
+    class INPUT(ctypes.Structure):
+        _fields_ = [("type", wintypes.DWORD), ("u", _UNION)]
+
+    INPUT_KEYBOARD  = 1
+    KEYEVENTF_KEYUP = 0x0002
+    user32 = ctypes.windll.user32
+
+    def send(vk):
+        arr = (INPUT * 2)()
+        arr[0].type = INPUT_KEYBOARD
+        arr[0].u.ki = KEYBDINPUT(vk, 0, 0, 0, 0)                   # 按下
+        arr[1].type = INPUT_KEYBOARD
+        arr[1].u.ki = KEYBDINPUT(vk, 0, KEYEVENTF_KEYUP, 0, 0)     # 抬起
+        return user32.SendInput(2, ctypes.byref(arr), ctypes.sizeof(INPUT)) == 2
+
+    return send
+
+
+_sendinput = None
+
+
+def send_media_key(vk):
+    global _sendinput
+    if _sendinput is None:
+        try:
+            _sendinput = _build_sendinput()
+        except Exception as e:
+            log("  !! 媒体键不可用（非 Windows？）:", e)
+            _sendinput = False
+    if not _sendinput:
+        return False
+    try:
+        return bool(_sendinput(vk))
+    except Exception as e:
+        log("  !! 发媒体键失败:", e)
+        return False
+
+
+def handle_cmd(cmd, no_remote_key=False):
+    """处理板子捎回来的命令。返回是否处理了一条。
+
+    不做去抖 —— 板子那边是「取走即清空」，本来就不会重复；
+    反而要保证用户**快速连滑两次**能被老老实实执行两次。
+    """
+    if not cmd:
+        return False
+    vk = _CMD_TO_VK.get(cmd)
+    if vk is None:
+        log(f"  ? 板子发来未知命令: {cmd!r}")
+        return False
+    cn = _CMD_CN.get(cmd, cmd)
+    if no_remote_key:
+        log(f"  ▶ 板子要求「{cn}」（--no-remote-key：只报告，不按键）")
+        return True
+    ok = send_media_key(vk)
+    log(f"  ▶ 板子要求「{cn}」-> 已发媒体键 {'✓' if ok else '✗ 失败'}")
+    return True
+
 
 def discover(timeout=3.0):
     """先试 mDNS 名字，再 UDP 广播。返回 (ip, info) 或 (None, None)"""
@@ -985,6 +1096,8 @@ def main():
                     help="不强制只认酷狗，任何播放器都桥接")
     ap.add_argument("--no-cover", action="store_true",
                     help="不抓专辑封面（板子左侧显示占位图）")
+    ap.add_argument("--no-remote-key", action="store_true",
+                    help="不在板子上响应切歌（左滑/右滑只打印日志，不发系统媒体键）")
     args = ap.parse_args()
 
     if args.probe:
@@ -1116,12 +1229,20 @@ def main():
                         log(f"   → pos={pos}ms state={info['state']}")
                     else:
                         try:
-                            board.push_pos(pos, info["state"], info["dur_ms"])
+                            r = board.push_pos(pos, info["state"], info["dur_ms"])
                             board.fails = 0
+                            # 板子把「左滑下一曲」这类命令捎在这个响应里带回来
+                            handle_cmd(r.get("cmd", ""), args.no_remote_key)
                         except Exception as e:
                             board.fails += 1
                             if board.fails in (1, 10, 50):
                                 log(f"   ⚠ 推送位置失败 x{board.fails}: {e}")
+                elif not args.dry_run:
+                    # 暂停时这一轮不推 pos，命令就没法捎带 —— 单独去取一次
+                    try:
+                        handle_cmd(board.poll_cmd(), args.no_remote_key)
+                    except Exception:
+                        pass
             else:
                 if last_key is not None:
                     log("⏸ 读不到播放信息（酷狗可能停播了）")

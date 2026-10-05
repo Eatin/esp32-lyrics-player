@@ -15,6 +15,19 @@
  *     POST /api/ext/offset?d=<ms>   或  ?v=<ms>               歌词整体偏移（对轴微调）
  *     POST /api/ext/clear                                    清空外部曲目
  *
+ * 反向通道（板子 -> PC）：
+ *   板子**不播音频**，所以在屏上左滑「下一曲」这类操作，本质是**请求电脑上的
+ *   播放器切歌**。做法是让命令搭 PC 轮询的顺风车 —— 板子把命令存在一个槽里，
+ *   PC 下一次 POST /api/ext/pos 时，命令就以 {"ok":1,"cmd":"next"} 的形式回传，
+ *   板子随即清空槽位（取走即消失，不会重复触发）。
+ *
+ *   之所以挂在 /api/ext/pos 而不是 /api/ext/state：**pos 只有桥接脚本调用**，
+ *   而 state 会被板子自己的网页控制台轮询，挂 state 上会被网页把命令偷走。
+ *
+ *   另留 GET /api/ext/cmd 供「暂停时 PC 不频繁推 pos」的场景单独取，语义相同；
+ *   POST /api/ext/cmd?c=next|prev|toggle 则可从外部直接投递一条命令
+ *   （不碰屏幕也能切歌，也方便自动化测试）。
+ *
  * 封面为什么推「原始 RGB565」而不是 JPEG：
  *   ESP32-S3 没有 JPEG 硬解，软解要占几十 KB flash 和几百 ms CPU；
  *   而 PC 那边本来就要用 Pillow 缩放，顺手转成 156x156 RGB565 一共才 48KB，
@@ -92,6 +105,23 @@ const uint8_t *ext_link_cover_data(void);
 /** 收到新封面 / 被清除 都会 +1（UI 靠它决定要不要重画） */
 uint32_t       ext_link_cover_seq(void);
 
+/* ------------------------- 板子 -> PC 命令 ------------------------- */
+
+/** 播放器遥控命令（PC 端把它翻成 Windows 媒体键） */
+#define XL_CMD_NONE   0     /* 无命令                       */
+#define XL_CMD_NEXT   1     /* 下一曲                       */
+#define XL_CMD_PREV   2     /* 上一曲                       */
+#define XL_CMD_TOGGLE 3     /* 播放/暂停（预留，暂未接 UI） */
+
+/** UI 调用：投递一条命令（覆盖式，只保留最后一条） */
+void        ext_link_post_cmd(int cmd);
+/** 取走并清空命令（返回 XL_CMD_*，无命令返回 XL_CMD_NONE） */
+int         ext_link_take_cmd(void);
+/** 命令名："next" / "prev" / "toggle" / ""（用于组 JSON） */
+const char *ext_link_cmd_name(int cmd);
+/** 当前是否有未取走的命令（诊断用） */
+bool        ext_link_cmd_pending(void);
+
 /* ------------------------- HTTP handlers ------------------------- */
 /* 这些函数在 web_player.c 里注册到 httpd 上（纯 C，可直接取地址） */
 
@@ -101,6 +131,7 @@ esp_err_t ext_link_h_state (httpd_req_t *req);   /* GET  /api/ext/state   */
 esp_err_t ext_link_h_offset(httpd_req_t *req);   /* POST /api/ext/offset  */
 esp_err_t ext_link_h_clear (httpd_req_t *req);   /* POST /api/ext/clear   */
 esp_err_t ext_link_h_cover (httpd_req_t *req);   /* POST /api/ext/cover   */
+esp_err_t ext_link_h_cmd   (httpd_req_t *req);   /* GET  /api/ext/cmd     */
 
 /* UDP 自动发现任务的启动次数（诊断用） */
 int         ext_link_udp_ok(void);
