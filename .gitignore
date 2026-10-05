@@ -1,0 +1,52 @@
+# ============================================================
+#  ESP32-S3-Touch-LCD-3.49 音乐歌词机 —— 版本库忽略规则
+# ============================================================
+#  原则：只提交「自研源码 + 文档 + 官方参考源码」。
+#  工具链、离线包、编译产物、缓存一律不入库（可重新下载 / 重新生成）。
+
+# ---------- 1. 构建工具链与离线包（体积巨大）----------
+/*.zip
+/tools/dl/
+/tools/pio-core/
+/tools/piobuild/
+/tools/pj/
+/tools/espvenv/
+/tools/arduino-cli.exe
+/tools/arduino-cli.zip
+/tools/LICENSE.txt
+/tools/pkg_esp32_index.json
+# 第三方 LVGL 库本体（约 125MB）；工程只依赖它旁边的 lv_conf.h，故只忽略本体
+/tools/arduino-user/libraries/lvgl/
+
+# ---------- 2. 编译产物 ----------
+/tools/build_w1/
+/tools/build_v5/
+/build*/
+*.bin
+*.elf
+*.map
+
+# ---------- 3. 运行期缓存与自动生成物（脚本可重建）----------
+/tools/covers/
+/tools/lyrics_cache/
+/tools/fonttest/
+/tools/preview/
+
+# ---------- 4. 日志与临时文件 ----------
+*.log
+/tools/uia_dump.txt
+/tools/new_page_top.txt
+/tools/readme_sec6.md
+/tools/test_push.lrc
+/tools/verify.lrc
+/tools/*.png
+
+# ---------- 5. 编辑器 / 系统文件 ----------
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+
+# ---------- 6. 临时备份 ----------
+*.bak
+*.orig

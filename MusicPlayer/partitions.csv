@@ -1,0 +1,35 @@
+# ESP32-S3-Touch-LCD-3.49 (V2) custom partition table - 16 MB flash
+#
+# Why not the menu option "16M Flash (3MB APP/9.9MB FATFS)" (app3M_fat9M_16MB)?
+#   That gives a 9 MB FAT partition which this project NEVER uses: music and
+#   lyrics live on the microSD card (esp_vfs_fat_sdmmc_mount("/sdcard")), so
+#   the on-board FAT partition wastes 9 MB while the app only gets 3 MB.
+#
+# Why the app needs to grow:
+#   The CJK font set went from "GB2312 level-1 only" to the full GB2312
+#   (6763 hanzi + 682 symbols + Latin-1 + music/star symbols = 7840 glyphs).
+#   Font bitmaps grew 1.31 MB -> 2.15 MB and the app is now ~3.9 MB, which no
+#   longer fits in 3 MB.  (Also worth knowing: LVGL's
+#   lv_font_fmt_txt_glyph_dsc_t.bitmap_index is only 20 bits, so a single
+#   font bitmap must stay below 1 MB - that is why the 20 px font is split
+#   into a primary + a fallback face.)
+#
+# Result: app 3 MB -> 2 x 7 MB (dual OTA slots kept, USB flashing unchanged).
+#
+# How it is used: the Arduino core prefers a partitions.csv located in the
+#   SKETCH directory over the menu selection
+#   (see platform.txt, recipe.hooks.prebuild.1), so build with
+#   PartitionScheme=custom.
+#
+# NOTE: keep this file ASCII-only and WITHOUT a BOM.
+#   tools/gen_esp32part.py checks line[0] == '#' to skip comments, so a UTF-8
+#   BOM makes the first line look like data and the build fails with
+#   "Field 'type' can't be left empty".  A BOM-free but non-ASCII file is also
+#   risky because that script reads the file with the system default encoding.
+#
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0x5000,
+otadata,    data, ota,      0xe000,   0x2000,
+app0,       app,  ota_0,    0x10000,  0x700000,
+app1,       app,  ota_1,    0x710000, 0x700000,
+coredump,   data, coredump, 0xE10000, 0x10000,
